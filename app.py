@@ -426,71 +426,44 @@ def download_completed_file(task_id: str):
 
 @app.get("/player", response_class=HTMLResponse)
 def serve_player(src: str, referer: Optional[str] = None, title: Optional[str] = None):
-    """Serves a clean, responsive HTML5 player with Hls.js support."""
+    """Serves a clean, responsive HTML5 player with robust Hls.js support."""
     clean_src = urllib.parse.unquote(src)
     clean_ref = urllib.parse.unquote(referer) if referer else ""
     display_title = urllib.parse.unquote(title) if title else "مشغل الفيديو"
 
     if clean_ref:
-        stream_src = f"/proxy?url={urllib.parse.quote(clean_src)}&referer={urllib.parse.quote(clean_ref)}"
+        stream_src = f"/proxy.m3u8?url={urllib.parse.quote(clean_src)}&referer={urllib.parse.quote(clean_ref)}"
     else:
         stream_src = clean_src
 
     html_content = f"""<!DOCTYPE html>
-<html lang="ar" dir="rtl">
+<html lang="ar">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{display_title}</title>
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            background-color: #0b0f19;
-            color: #f8fafc;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        html, body {{
+            width: 100%;
+            height: 100%;
+            background-color: #000;
+            overflow: hidden;
             display: flex;
-            flex-direction: column;
             align-items: center;
             justify-content: center;
-            min-height: 100vh;
-            padding: 16px;
-        }}
-        .header {{
-            margin-bottom: 16px;
-            text-align: center;
-            max-width: 900px;
-        }}
-        .header h1 {{
-            font-size: 1.25rem;
-            font-weight: 600;
-            color: #e2e8f0;
-            word-break: break-word;
-        }}
-        .player-container {{
-            width: 100%;
-            max-width: 960px;
-            background: #000;
-            border-radius: 16px;
-            overflow: hidden;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.5);
-            border: 1px solid #1e293b;
         }}
         video {{
             width: 100%;
-            height: auto;
-            display: block;
-            max-height: 80vh;
+            height: 100%;
+            object-fit: contain;
+            background-color: #000;
         }}
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>{display_title}</h1>
-    </div>
-    <div class="player-container">
-        <video id="video" controls autoplay playsinline></video>
-    </div>
+    <video id="video" controls autoplay playsinline></video>
     <script>
         const video = document.getElementById('video');
         const videoSrc = '{stream_src}';
@@ -498,17 +471,46 @@ def serve_player(src: str, referer: Optional[str] = None, title: Optional[str] =
         if (Hls.isSupported()) {{
             const hls = new Hls({{
                 enableWorker: true,
-                lowLatencyMode: true,
+                maxBufferLength: 30,
+                maxMaxBufferLength: 60,
+                startFragPrefetch: true,
             }});
             hls.loadSource(videoSrc);
             hls.attachMedia(video);
             hls.on(Hls.Events.MANIFEST_PARSED, function() {{
-                video.play().catch(e => console.log('Autoplay prevented'));
+                const playPromise = video.play();
+                if (playPromise !== undefined) {{
+                    playPromise.catch(function() {{
+                        video.muted = true;
+                        video.play();
+                    }});
+                }}
+            }});
+            hls.on(Hls.Events.ERROR, function(event, data) {{
+                if (data.fatal) {{
+                    switch (data.type) {{
+                        case Hls.ErrorTypes.NETWORK_ERROR:
+                            console.log('Hls network error, recovering...');
+                            hls.startLoad();
+                            break;
+                        case Hls.ErrorTypes.MEDIA_ERROR:
+                            console.log('Hls media error, recovering...');
+                            hls.recoverMediaError();
+                            break;
+                        default:
+                            console.log('Hls fatal error:', data.details);
+                            hls.destroy();
+                            break;
+                    }}
+                }}
             }});
         }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
             video.src = videoSrc;
             video.addEventListener('loadedmetadata', function() {{
-                video.play().catch(e => console.log('Autoplay prevented'));
+                video.play().catch(function() {{
+                    video.muted = true;
+                    video.play();
+                }});
             }});
         }}
     </script>
