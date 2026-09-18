@@ -102,7 +102,14 @@ async def parse_m3u8_qualities(
     """Fetches master.m3u8 playlist and extracts individual resolution streams."""
     qualities: List[VideoQuality] = []
     try:
-        headers = {"User-Agent": user_agent, "Referer": referer}
+        ref_split = urllib.parse.urlsplit(referer) if referer else None
+        origin = f"{ref_split.scheme}://{ref_split.netloc}" if (ref_split and ref_split.netloc) else "https://google.com"
+        headers = {
+            "User-Agent": user_agent,
+            "Referer": referer,
+            "Origin": origin,
+            "Accept": "*/*",
+        }
         async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=8.0) as client:
             resp = await client.get(master_url)
             if resp.status_code == 200:
@@ -524,7 +531,8 @@ async def extract_video(req: ExtractRequest):
     if not url.startswith("http://") and not url.startswith("https://"):
         raise HTTPException(status_code=400, detail="Invalid URL protocol")
 
-    domain = urllib.parse.urlparse(url).netloc
+    raw_netloc = urllib.parse.urlparse(url).netloc
+    domain = re.sub(r"^www\.", "", raw_netloc)
     referer = f"{urllib.parse.urlparse(url).scheme}://{domain}/"
     origin = f"{urllib.parse.urlparse(url).scheme}://{domain}"
 
