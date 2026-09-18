@@ -148,9 +148,10 @@ def health_check():
         "endpoints": ["/extract", "/proxy", "/player", "/download"],
     }
 
+@app.get("/proxy.m3u8")
 @app.get("/proxy")
 async def proxy_stream(url: str, referer: Optional[str] = None):
-    """Proxies m3u8 playlists and video chunks with correct Referer header to bypass 403."""
+    """Proxies m3u8 playlists and video chunks with correct Referer and Origin headers."""
     clean_url = urllib.parse.unquote(url)
     clean_referer = urllib.parse.unquote(referer) if referer else "https://google.com/"
     ref_split = urllib.parse.urlsplit(clean_referer)
@@ -172,7 +173,7 @@ async def proxy_stream(url: str, referer: Optional[str] = None):
             resp = await client.get(clean_url)
             content_type = resp.headers.get("content-type", "application/octet-stream")
 
-            if "mpegurl" in content_type or clean_url.endswith(".m3u8"):
+            if "mpegurl" in content_type or clean_url.endswith(".m3u8") or ".m3u8" in clean_url:
                 text = resp.text
                 lines = text.splitlines()
                 rewritten = []
@@ -180,15 +181,25 @@ async def proxy_stream(url: str, referer: Optional[str] = None):
                     stripped = line.strip()
                     if stripped and not stripped.startswith("#"):
                         abs_url = urllib.parse.urljoin(clean_url, stripped)
+                        if "?" not in stripped and "?" in clean_url:
+                            q = urllib.parse.urlparse(clean_url).query
+                            if q:
+                                abs_url = abs_url + ("&" if "?" in abs_url else "?") + q
                         encoded_target = urllib.parse.quote(abs_url)
                         encoded_ref = urllib.parse.quote(clean_referer)
-                        rewritten.append(f"/proxy?url={encoded_target}&referer={encoded_ref}")
+                        if ".m3u8" in abs_url:
+                            rewritten.append(f"/proxy.m3u8?url={encoded_target}&referer={encoded_ref}")
+                        else:
+                            rewritten.append(f"/proxy?url={encoded_target}&referer={encoded_ref}")
                     else:
                         rewritten.append(line)
                 return Response(
                     content="\n".join(rewritten),
                     media_type="application/vnd.apple.mpegurl",
-                    headers={"Access-Control-Allow-Origin": "*"},
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Content-Type": "application/vnd.apple.mpegurl",
+                    },
                 )
 
             return Response(
