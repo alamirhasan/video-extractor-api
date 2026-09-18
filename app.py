@@ -159,6 +159,7 @@ async def proxy_stream(url: str, referer: Optional[str] = None):
     """Proxies m3u8 playlists and video chunks with correct Referer and Origin headers."""
     clean_url = urllib.parse.unquote(url)
     clean_referer = urllib.parse.unquote(referer) if referer else "https://google.com/"
+    clean_referer = re.sub(r"^(https?://)www\.", r"\1", clean_referer)
     ref_split = urllib.parse.urlsplit(clean_referer)
     origin = f"{ref_split.scheme}://{ref_split.netloc}" if ref_split.netloc else "https://google.com"
 
@@ -316,10 +317,12 @@ async def extract_video(req: ExtractRequest):
     if not url.startswith("http://") and not url.startswith("https://"):
         raise HTTPException(status_code=400, detail="Invalid URL protocol")
 
-    raw_netloc = urllib.parse.urlparse(url).netloc
-    domain = re.sub(r"^www\.", "", raw_netloc)
-    referer = f"{urllib.parse.urlparse(url).scheme}://{domain}/"
-    origin = f"{urllib.parse.urlparse(url).scheme}://{domain}"
+    # Normalize input URL: strip leading 'www.' from host while strictly preserving the full embed path
+    clean_url = re.sub(r"^(https?://)www\.", r"\1", url)
+    url_split = urllib.parse.urlsplit(clean_url)
+    domain = url_split.netloc
+    referer = clean_url
+    origin = f"{url_split.scheme}://{domain}"
 
     request_headers = {
         "User-Agent": (
@@ -339,7 +342,7 @@ async def extract_video(req: ExtractRequest):
 
     try:
         async with httpx.AsyncClient(headers=request_headers, follow_redirects=True, timeout=15.0) as client:
-            resp = await client.get(url)
+            resp = await client.get(clean_url)
             html = resp.text
 
         title_match = re.search(r"<title>(.*?)</title>", html, re.I)
@@ -398,7 +401,7 @@ async def extract_video(req: ExtractRequest):
         )
 
         if direct_sources:
-            src = urllib.parse.urljoin(url, direct_sources[0])
+            src = urllib.parse.urljoin(clean_url, direct_sources[0])
             return ExtractResponse(
                 success=True,
                 title=page_title,
@@ -419,7 +422,7 @@ async def extract_video(req: ExtractRequest):
                 "http_headers": request_headers,
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+                info = ydl.extract_info(clean_url, download=False)
                 if info:
                     qualities = []
                     formats = info.get("formats", [])
