@@ -1,32 +1,30 @@
 # ==============================================================================
 # File: backend/app.py
-# Description: FastAPI microservice for universal web video extraction, streaming, and download.
+# Description: FastAPI microservice for universal web video extraction and streaming.
 # Module: Backend Microservice
 # Purpose: Inspects web pages, unpacks obfuscated scripts (Dean Edwards p,a,c,k,e,d),
 #          parses multi-quality HLS streams, proxies video chunks with Referer headers,
-#          serves an embedded Hls.js web player, and remuxes streams into MP4 files for direct download.
-# Consumers: Consumed by Flutter Web & Mobile client via /extract, /proxy, /player, and /download.
+#          and serves an embedded Hls.js web player for seamless in-app streaming.
+# Consumers: Consumed by Flutter Web & Mobile client via /extract, /proxy, and /player.
 # Notes: Fully permissive CORS enabled to support cross-origin requests from any browser.
 # ==============================================================================
 
 import asyncio
 import os
 import re
-import subprocess
 import time
 import urllib.parse
-import uuid
 from typing import Dict, List, Optional
-from fastapi import FastAPI, HTTPException, Response, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import httpx
 
 app = FastAPI(
     title="Universal Video Extractor API",
-    version="1.2.0",
-    description="Extracts, plays, and downloads video streams across all platforms.",
+    version="1.3.0",
+    description="Extracts and streams video streams across all platforms.",
 )
 
 # Enable CORS for Flutter Web and cross-origin requests
@@ -217,219 +215,6 @@ async def proxy_stream(url: str, referer: Optional[str] = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
 
-# ==============================================================================
-# Download Task Manager & Endpoints
-# ==============================================================================
-
-DOWNLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
-os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-
-class DownloadTask:
-    def __init__(self, task_id: str, title: str, url: str, referer: Optional[str], duration: Optional[float]):
-        self.task_id = task_id
-        self.title = title
-        self.url = url
-        self.referer = referer or ""
-        self.total_duration_sec = duration or 0.0
-        self.status = "downloading"  # downloading, completed, failed, cancelled
-        self.progress_percent = 0.0
-        self.downloaded_bytes = 0
-        self.total_bytes = 0
-        self.speed_bytes_sec = 0.0
-        self.eta_seconds = 0
-        self.error_message: Optional[str] = None
-        self.created_at = time.time()
-        self.proc: Optional[asyncio.subprocess.Process] = None
-        self.file_path = os.path.join(DOWNLOADS_DIR, f"{task_id}.mp4")
-
-    def to_dict(self):
-        return {
-            "task_id": self.task_id,
-            "title": self.title,
-            "url": self.url,
-            "status": self.status,
-            "progress_percent": round(self.progress_percent, 1),
-            "downloaded_bytes": self.downloaded_bytes,
-            "total_bytes": self.total_bytes,
-            "speed_bytes_sec": round(self.speed_bytes_sec, 1),
-            "eta_seconds": int(self.eta_seconds),
-            "file_url": f"/download/file/{self.task_id}" if self.status == "completed" else None,
-            "error_message": self.error_message,
-        }
-
-DOWNLOAD_TASKS: Dict[str, DownloadTask] = {}
-
-async def _run_ffmpeg_download_task(task: DownloadTask):
-    safe_title = re.sub(r'[\\/*?:"<>|]', "", task.title).strip() or "video"
-    ffmpeg_headers = f"Referer: {task.referer}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n" if task.referer else ""
-    
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-headers", ffmpeg_headers,
-        "-i", task.url,
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        "-movflags", "+faststart",
-        "-progress", "pipe:1",
-        task.file_path,
-    ]
-
-    start_time = time.time()
-    last_check_time = start_time
-    last_bytes = 0
-
-    try:
-        task.proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-
-        while True:
-            line = await task.proc.stdout.readline()
-            if not line:
-                break
-            line_str = line.decode("utf-8", errors="ignore").strip()
-
-            # Parse ffmpeg -progress output (e.g. out_time_us=12345000, total_size=456789)
-            if line_str.startswith("out_time_us="):
-                try:
-                    time_us = int(line_str.split("=")[1])
-                    time_sec = time_us / 1000000.0
-                    if task.total_duration_sec > 0:
-                        task.progress_percent = min(99.0, (time_sec / task.total_duration_sec) * 100.0)
-                except (ValueError, IndexError):
-                    pass
-
-            elif line_str.startswith("total_size="):
-                try:
-                    size_val = int(line_str.split("=")[1])
-                    if size_val > 0:
-                        task.downloaded_bytes = size_val
-                except (ValueError, IndexError):
-                    pass
-
-            now = time.time()
-            dt = now - last_check_time
-            if dt >= 1.0:
-                # Update speed and ETA
-                bytes_diff = task.downloaded_bytes - last_bytes
-                task.speed_bytes_sec = bytes_diff / dt if dt > 0 else 0.0
-                last_bytes = task.downloaded_bytes
-                last_check_time = now
-
-                # Estimate total bytes
-                if task.progress_percent > 3.0:
-                    task.total_bytes = int((task.downloaded_bytes / task.progress_percent) * 100.0)
-                    if task.speed_bytes_sec > 0:
-                        bytes_left = max(0, task.total_bytes - task.downloaded_bytes)
-                        task.eta_seconds = int(bytes_left / task.speed_bytes_sec)
-
-        await task.proc.wait()
-
-        if task.status != "cancelled":
-            if task.proc.returncode == 0 and os.path.exists(task.file_path):
-                task.status = "completed"
-                task.progress_percent = 100.0
-                actual_size = os.path.getsize(task.file_path)
-                task.downloaded_bytes = actual_size
-                task.total_bytes = actual_size
-                task.eta_seconds = 0
-                task.speed_bytes_sec = 0.0
-            else:
-                task.status = "failed"
-                task.error_message = "FFmpeg process failed to complete download."
-
-    except asyncio.CancelledError:
-        task.status = "cancelled"
-        if task.proc and task.proc.returncode is None:
-            task.proc.kill()
-        if os.path.exists(task.file_path):
-            try:
-                os.remove(task.file_path)
-            except OSError:
-                pass
-    except Exception as e:
-        task.status = "failed"
-        task.error_message = str(e)
-
-
-class CreateDownloadTaskRequest(BaseModel):
-    url: str
-    referer: Optional[str] = None
-    title: str = "video"
-    duration: Optional[float] = None
-
-@app.post("/download/task")
-async def create_download_task(req: CreateDownloadTaskRequest, background_tasks: BackgroundTasks):
-    """Creates a background download task that tracks progress, speed, size, and ETA."""
-    clean_url = urllib.parse.unquote(req.url)
-    clean_ref = urllib.parse.unquote(req.referer) if req.referer else ""
-    task_id = str(uuid.uuid4())[:8]
-
-    task = DownloadTask(
-        task_id=task_id,
-        title=req.title,
-        url=clean_url,
-        referer=clean_ref,
-        duration=req.duration,
-    )
-    DOWNLOAD_TASKS[task_id] = task
-
-    background_tasks.add_task(_run_ffmpeg_download_task, task)
-    return task.to_dict()
-
-@app.get("/download/task/{task_id}")
-def get_download_task_status(task_id: str):
-    """Fetches real-time progress, size, speed, and ETA for an active download task."""
-    task = DOWNLOAD_TASKS.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Download task not found")
-    return task.to_dict()
-
-@app.get("/download/tasks")
-def list_download_tasks():
-    """Lists all download tasks currently recorded."""
-    return [task.to_dict() for task in reversed(list(DOWNLOAD_TASKS.values()))]
-
-@app.delete("/download/task/{task_id}")
-def cancel_download_task(task_id: str):
-    """Cancels and cleans up an ongoing download task."""
-    task = DOWNLOAD_TASKS.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Download task not found")
-    task.status = "cancelled"
-    if task.proc and task.proc.returncode is None:
-        try:
-            task.proc.kill()
-        except ProcessLookupError:
-            pass
-    if os.path.exists(task.file_path):
-        try:
-            os.remove(task.file_path)
-        except OSError:
-            pass
-    return {"status": "cancelled", "task_id": task_id}
-
-@app.get("/download/file/{task_id}")
-def download_completed_file(task_id: str):
-    """Serves the completed .mp4 file with full Content-Length and seekable ranges."""
-    task = DOWNLOAD_TASKS.get(task_id)
-    if not task or task.status != "completed" or not os.path.exists(task.file_path):
-        raise HTTPException(status_code=404, detail="File not ready or not found")
-
-    safe_title = re.sub(r'[\\/*?:"<>|]', "", task.title).strip() or "video"
-    encoded_filename = urllib.parse.quote(f"{safe_title}.mp4")
-
-    return FileResponse(
-        task.file_path,
-        media_type="video/mp4",
-        headers={
-            "Content-Disposition": f'attachment; filename="{safe_title}.mp4"; filename*=UTF-8\'\'{encoded_filename}',
-            "Access-Control-Allow-Origin": "*",
-        },
-    )
 
 @app.get("/player", response_class=HTMLResponse)
 def serve_player(src: str, referer: Optional[str] = None, title: Optional[str] = None):
