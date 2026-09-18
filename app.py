@@ -112,6 +112,10 @@ async def parse_m3u8_qualities(
                         uri_line = lines[i + 1].strip()
                         if uri_line and not uri_line.startswith("#"):
                             full_url = urllib.parse.urljoin(master_url, uri_line)
+                            if "?" not in uri_line and "?" in master_url:
+                                master_query = urllib.parse.urlparse(master_url).query
+                                if master_query:
+                                    full_url += ("&" if "?" in full_url else "?") + master_query
                             res_match = re.search(r"RESOLUTION=(\d+x\d+)", line)
                             label = "Auto"
                             if res_match:
@@ -149,6 +153,8 @@ async def proxy_stream(url: str, referer: Optional[str] = None):
     """Proxies m3u8 playlists and video chunks with correct Referer header to bypass 403."""
     clean_url = urllib.parse.unquote(url)
     clean_referer = urllib.parse.unquote(referer) if referer else "https://google.com/"
+    ref_split = urllib.parse.urlsplit(clean_referer)
+    origin = f"{ref_split.scheme}://{ref_split.netloc}" if ref_split.netloc else "https://google.com"
 
     headers = {
         "User-Agent": (
@@ -157,6 +163,8 @@ async def proxy_stream(url: str, referer: Optional[str] = None):
             "Chrome/122.0.0.0 Safari/537.36"
         ),
         "Referer": clean_referer,
+        "Origin": origin,
+        "Accept": "*/*",
     }
 
     try:
@@ -505,6 +513,7 @@ async def extract_video(req: ExtractRequest):
 
     domain = urllib.parse.urlparse(url).netloc
     referer = f"{urllib.parse.urlparse(url).scheme}://{domain}/"
+    origin = f"{urllib.parse.urlparse(url).scheme}://{domain}"
 
     request_headers = {
         "User-Agent": (
@@ -513,7 +522,13 @@ async def extract_video(req: ExtractRequest):
             "Chrome/122.0.0.0 Safari/537.36"
         ),
         "Referer": referer,
+        "Origin": origin,
         "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+    }
+    stream_headers = {
+        "Referer": referer,
+        "Origin": origin,
+        "User-Agent": request_headers["User-Agent"],
     }
 
     try:
@@ -562,7 +577,7 @@ async def extract_video(req: ExtractRequest):
                             duration=duration,
                             stream_url=main_stream,
                             qualities=qualities,
-                            headers={"Referer": referer, "User-Agent": request_headers["User-Agent"]},
+                            headers=stream_headers,
                         )
 
         # Phase 2: Direct HTML5 tags
@@ -585,7 +600,7 @@ async def extract_video(req: ExtractRequest):
                 duration=None,
                 stream_url=src,
                 qualities=[VideoQuality(label="Original (الأصلية)", url=src)],
-                headers={"Referer": referer, "User-Agent": request_headers["User-Agent"]},
+                headers=stream_headers,
             )
 
         # Phase 3: Generic yt-dlp fallback
@@ -617,7 +632,7 @@ async def extract_video(req: ExtractRequest):
                             duration=info.get("duration"),
                             stream_url=main_url,
                             qualities=qualities if qualities else [VideoQuality(label="Default", url=main_url)],
-                            headers={"Referer": referer, "User-Agent": request_headers["User-Agent"]},
+                            headers=stream_headers,
                         )
         except Exception:
             pass
