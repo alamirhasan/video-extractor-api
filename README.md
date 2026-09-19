@@ -1,13 +1,16 @@
----
-title: Video Extractor API
-emoji: 🎬
-colorFrom: indigo
-colorTo: cyan
-sdk: docker
-pinned: false
-app_port: 7860
----
+# Video Extractor & Streaming Proxy Service
 
-# Universal Video Extractor API
-High-performance video extraction and stream analysis microservice.
-Supports Dean Edwards packed JS deobfuscation, direct HTML5 tags, and HLS/m3u8 stream detection.
+خادم ويب عام لاستخراج روابط الفيديو الحقيقية (بجودات متعددة من 360p إلى 1080p) وتشغيلها عبر بروكسي تدفقي فائق السرعة.
+
+## المميزات
+- استخراج وفك تشفير الجودات لـ 7 سيرفرات رئيسية:
+  - StreamTape (MP4 1080p)
+  - VidMoly (HLS 720p)
+  - Hlswish (HLS 720p)
+  - Uqload (HLS 360p + 720p)
+  - Vidoba (HLS 360p + 480p)
+  - VidSpeed (HLS 360p + 480p)
+  - 1Vid (HLS 720p)
+- مشغل فيديو مدمج في واجهة الويب يدعم HLS و MP4.
+- بروكسي تدفقي ذكي لحقن ترويسات الحماية (Referer) وتدفق المقاطع دون انقطاع عبر Persistent Connection Pooling.
+- متوافق بالكامل مع خوادم Render و Cloudflare.
