@@ -267,6 +267,9 @@ async def proxy_stream(
         raise HTTPException(status_code=500, detail=f"Streaming proxy error: {str(e)}")
 
 
+# Dedicated Cloudflare Edge streaming proxy for unlimited bandwidth and zero server load
+CLOUDFLARE_PROXY_URL = "https://video-stream-proxy.mrmra.workers.dev"
+
 @app.get("/player", response_class=HTMLResponse)
 def serve_player(src: str, referer: Optional[str] = None, title: Optional[str] = None):
     """Serves a clean, responsive HTML5 player with smart dual-mode playback."""
@@ -278,7 +281,7 @@ def serve_player(src: str, referer: Optional[str] = None, title: Optional[str] =
 
     if clean_ref:
         if is_mp4:
-            stream_src = f"/proxy.mp4?url={urllib.parse.quote(clean_src)}&referer={urllib.parse.quote(clean_ref)}"
+            stream_src = f"{CLOUDFLARE_PROXY_URL}/?url={urllib.parse.quote(clean_src)}&referer={urllib.parse.quote(clean_ref)}"
         else:
             stream_src = f"/proxy.m3u8?url={urllib.parse.quote(clean_src)}&referer={urllib.parse.quote(clean_ref)}"
     else:
