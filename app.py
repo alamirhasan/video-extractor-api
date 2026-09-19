@@ -154,6 +154,7 @@ def health_check():
     }
 
 @app.get("/proxy.m3u8")
+@app.get("/proxy.ts")
 @app.get("/proxy")
 async def proxy_stream(url: str, referer: Optional[str] = None):
     """Proxies m3u8 playlists and video chunks with correct Referer and Origin headers."""
@@ -196,7 +197,7 @@ async def proxy_stream(url: str, referer: Optional[str] = None):
                         if ".m3u8" in abs_url:
                             rewritten.append(f"/proxy.m3u8?url={encoded_target}&referer={encoded_ref}")
                         else:
-                            rewritten.append(f"/proxy?url={encoded_target}&referer={encoded_ref}")
+                            rewritten.append(f"/proxy.ts?url={encoded_target}&referer={encoded_ref}")
                     else:
                         rewritten.append(line)
                 return Response(
@@ -208,10 +209,17 @@ async def proxy_stream(url: str, referer: Optional[str] = None):
                     },
                 )
 
+            # Enforce video/mp2t for TS segments to satisfy mobile ExoPlayer container sniffing
+            if ".ts" in clean_url or "mp2t" in content_type:
+                content_type = "video/mp2t"
+
             return Response(
                 content=resp.content,
                 media_type=content_type,
-                headers={"Access-Control-Allow-Origin": "*"},
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Content-Type": content_type,
+                },
             )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
