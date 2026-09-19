@@ -319,6 +319,192 @@ def serve_player(src: str, referer: Optional[str] = None, title: Optional[str] =
 </html>"""
     return HTMLResponse(content=html_content)
 
+async def resolve_direct_video_stream(url: str, default_title: str = ""):
+    """
+    Direct Stream Extractor Engine.
+    Resolves a single video host URL into playable media streams (.m3u8 or .mp4).
+    Uses specialized fast-path resolvers (Vidara, Mp4Upload), Dean Edwards unpacking,
+    HTML5 video sources, and yt-dlp fallback.
+    """
+    url_clean = re.sub(r"^(https?://)www\.", r"\1", url.strip())
+    parsed = urllib.parse.urlsplit(url_clean)
+    domain = parsed.netloc
+    origin = f"{parsed.scheme}://{domain}"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Referer": url_clean,
+        "Origin": origin,
+        "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+    }
+
+    # Fast-Path 1: Vidara Provider
+    if "vidara" in domain:
+        try:
+            filecode_match = re.search(r"/e/([a-zA-Z0-9_-]+)", url_clean)
+            if filecode_match:
+                filecode = filecode_match.group(1)
+                api_url = f"{parsed.scheme}://{domain}/api/stream"
+                async with httpx.AsyncClient(headers=headers, timeout=8.0) as client:
+                    api_resp = await client.post(
+                        api_url,
+                        json={"filecode": filecode, "device": "web"},
+                        headers={"Content-Type": "application/json", "Referer": url_clean},
+                    )
+                    if api_resp.status_code == 200:
+                        data = api_resp.json()
+                        stream_url = data.get("streaming_url")
+                        if stream_url:
+                            thumbnail = data.get("thumbnail")
+                            title = data.get("title") or default_title or domain
+                            parsed_qualities = []
+                            if ".m3u8" in stream_url:
+                                parsed_qualities = await parse_m3u8_qualities(stream_url, url_clean, headers["User-Agent"])
+                            return {
+                                "stream_url": stream_url,
+                                "qualities": parsed_qualities if parsed_qualities else [VideoQuality(label="Original", url=stream_url)],
+                                "title": title,
+                                "thumbnail": thumbnail,
+                                "duration": None,
+                            }
+        except Exception:
+            pass
+
+    # Fast-Path 2: Mp4Upload Provider
+    if "mp4upload" in domain:
+        try:
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=8.0) as client:
+                resp = await client.get(url_clean)
+                html = resp.text
+                mp4_match = re.search(r'https?://[^"\'<>\s]+/video\.mp4', html)
+                poster_match = re.search(r'player\.poster\(["\'](https?://[^"\']+)["\']\)', html)
+                if mp4_match:
+                    video_url = mp4_match.group(0)
+                    return {
+                        "stream_url": video_url,
+                        "qualities": [VideoQuality(label="MP4", url=video_url)],
+                        "title": default_title or domain,
+                        "thumbnail": poster_match.group(1) if poster_match else None,
+                        "duration": None,
+                    }
+        except Exception:
+            pass
+
+    # Standard Scraping: Dean Edwards & HTML5
+    try:
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=10.0) as client:
+            resp = await client.get(url_clean)
+            html = resp.text
+
+        title_match = re.search(r"<title>(.*?)</title>", html, re.I)
+        page_title = title_match.group(1).strip() if title_match else (default_title or domain)
+
+        # Dean Edwards packed scripts
+        scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL | re.I)
+        for script in scripts:
+            if "eval(function(p,a,c,k,e,d)" in script:
+                unpacked = unpack_dean_edwards(script)
+                if unpacked:
+                    media_links = re.findall(
+                        r'https?://[^\s"\'<>]+\.(?:m3u8|mp4|webm)[^\s"\'<>]*',
+                        unpacked,
+                        re.I,
+                    )
+                    img_match = re.search(r'image\s*:\s*["\'](https?://[^"\']+)["\']', unpacked, re.I)
+                    thumbnail = img_match.group(1) if img_match else None
+
+                    dur_match = re.search(r'duration\s*:\s*["\']?([\d\.]+)["\']?', unpacked, re.I)
+                    duration = float(dur_match.group(1)) if dur_match else None
+
+                    if media_links:
+                        main_stream = media_links[0]
+                        qualities: List[VideoQuality] = []
+                        if ".m3u8" in main_stream:
+                            qualities = await parse_m3u8_qualities(
+                                main_stream,
+                                url_clean,
+                                headers["User-Agent"],
+                            )
+                        if not qualities:
+                            qualities = [VideoQuality(label="Auto (تلقائي)", url=main_stream)]
+                        return {
+                            "stream_url": main_stream,
+                            "qualities": qualities,
+                            "title": page_title,
+                            "thumbnail": thumbnail,
+                            "duration": duration,
+                        }
+
+        # Direct HTML5 <source> or <video> tags
+        direct_sources = re.findall(
+            r'<source[^>]+src=["\']([^"\']+)["\']',
+            html,
+            re.I,
+        ) or re.findall(
+            r'<video[^>]+src=["\']([^"\']+)["\']',
+            html,
+            re.I,
+        )
+        if direct_sources:
+            src = urllib.parse.urljoin(url_clean, direct_sources[0])
+            return {
+                "stream_url": src,
+                "qualities": [VideoQuality(label="Original (الأصلية)", url=src)],
+                "title": page_title,
+                "thumbnail": None,
+                "duration": None,
+            }
+    except Exception:
+        pass
+
+    # Generic Fallback: yt-dlp (run in thread to prevent blocking event loop)
+    def _run_ytdlp():
+        try:
+            import yt_dlp
+            ydl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "extract_flat": False,
+                "socket_timeout": 4,
+                "http_headers": headers,
+                "nocheckcertificate": True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url_clean, download=False)
+                if info:
+                    qualities = []
+                    formats = info.get("formats", [])
+                    for f in formats:
+                        f_url = f.get("url")
+                        if f_url and f.get("vcodec") != "none":
+                            res = f.get("format_note") or f.get("resolution") or "Video"
+                            qualities.append(VideoQuality(label=res, url=f_url, resolution=res))
+                    main_url = info.get("url") or (qualities[0].url if qualities else None)
+                    if main_url:
+                        return {
+                            "stream_url": main_url,
+                            "qualities": qualities if qualities else [VideoQuality(label="Default", url=main_url)],
+                            "title": info.get("title") or default_title or domain,
+                            "thumbnail": info.get("thumbnail"),
+                            "duration": info.get("duration"),
+                        }
+        except Exception:
+            pass
+        return None
+
+    try:
+        ytdlp_res = await asyncio.wait_for(asyncio.to_thread(_run_ytdlp), timeout=5.0)
+        if ytdlp_res:
+            return ytdlp_res
+    except Exception:
+        pass
+
+    return None
+
 @app.post("/extract", response_model=ExtractResponse)
 async def extract_video(req: ExtractRequest):
     url = req.url.strip()
@@ -349,21 +535,26 @@ async def extract_video(req: ExtractRequest):
     }
 
     try:
-        async with httpx.AsyncClient(headers=request_headers, follow_redirects=True, timeout=15.0) as client:
-            resp = await client.get(clean_url)
-            html = resp.text
+        # Layer 1: Hub / Container Detection (e.g. MegaMax multi-server hub)
+        is_megamax_hub = "megamax.me" in url_split.netloc
+        if not is_megamax_hub:
+            async with httpx.AsyncClient(headers=request_headers, follow_redirects=True, timeout=12.0) as check_client:
+                resp = await check_client.get(clean_url)
+                html = resp.text
+                if "files/mirror/video" in html or "files\\/mirror\\/video" in html:
+                    is_megamax_hub = True
 
-        title_match = re.search(r"<title>(.*?)</title>", html, re.I)
-        page_title = title_match.group(1).strip() if title_match else domain
-
-        # Phase 0: Multi-Server Hubs (MegaMax Inertia.js)
-        if "megamax.me" in url or "files/mirror/video" in html or "files\\/mirror\\/video" in html:
+        if is_megamax_hub:
             try:
-                name_match = re.search(r'"name":"([^"]+)"', html)
-                if name_match:
-                    page_title = name_match.group(1).replace(r'\"', '"')
+                # Fetch Hub page and Inertia streams
+                async with httpx.AsyncClient(headers=request_headers, follow_redirects=True, timeout=12.0) as hub_client:
+                    page_resp = await hub_client.get(clean_url)
+                    hub_html = page_resp.text
 
-                version_match = re.search(r'"version":"([^"]+)"', html)
+                name_match = re.search(r'"name":"([^"]+)"', hub_html)
+                hub_title = name_match.group(1).replace(r'\"', '"') if name_match else domain
+
+                version_match = re.search(r'"version":"([^"]+)"', hub_html)
                 version = version_match.group(1) if version_match else "a601a2d0d16b8ae7121ceb1fd46c1f5a"
 
                 inertia_headers = dict(request_headers)
@@ -376,12 +567,15 @@ async def extract_video(req: ExtractRequest):
                     "X-Requested-With": "XMLHttpRequest",
                 })
 
-                async with httpx.AsyncClient(headers=inertia_headers, follow_redirects=True, timeout=12.0) as hub_client:
-                    hub_resp = await hub_client.get(clean_url)
-                    if hub_resp.status_code == 200:
-                        hub_data = hub_resp.json()
+                async with httpx.AsyncClient(headers=inertia_headers, follow_redirects=True, timeout=12.0) as data_client:
+                    data_resp = await data_client.get(clean_url)
+                    if data_resp.status_code == 200:
+                        hub_data = data_resp.json()
                         streams = hub_data.get("props", {}).get("streams", {}).get("data", [])
-                        qualities: List[VideoQuality] = []
+                        
+                        # Gather all mirrors to resolve them into real playable video streams
+                        mirror_tasks = []
+                        mirror_meta = []
                         for group in streams:
                             res_label = group.get("label", "Default").replace(" (source)", "").strip()
                             resolution = group.get("resolution")
@@ -391,123 +585,62 @@ async def extract_video(req: ExtractRequest):
                                 if link.startswith("//"):
                                     link = f"https:{link}"
                                 if link:
-                                    qualities.append(
-                                        VideoQuality(
-                                            label=f"{res_label} - {driver}",
-                                            url=link,
-                                            resolution=resolution,
-                                        )
+                                    mirror_meta.append({
+                                        "label": f"{res_label} - {driver}",
+                                        "resolution": resolution,
+                                        "driver": driver,
+                                        "link": link
+                                    })
+                                    mirror_tasks.append(resolve_direct_video_stream(link, default_title=hub_title))
+
+                        # Execute video stream extraction for all mirrors in parallel
+                        results = await asyncio.gather(*mirror_tasks, return_exceptions=True)
+                        verified_qualities: List[VideoQuality] = []
+                        primary_stream_url = None
+                        primary_thumbnail = None
+                        primary_duration = None
+
+                        for meta, res in zip(mirror_meta, results):
+                            if isinstance(res, dict) and res.get("stream_url"):
+                                s_url = res["stream_url"]
+                                if not primary_stream_url:
+                                    primary_stream_url = s_url
+                                    primary_thumbnail = res.get("thumbnail")
+                                    primary_duration = res.get("duration")
+
+                                verified_qualities.append(
+                                    VideoQuality(
+                                        label=meta["label"],
+                                        url=s_url,
+                                        resolution=meta["resolution"],
                                     )
-                        if qualities:
+                                )
+
+                        if verified_qualities and primary_stream_url:
                             return ExtractResponse(
                                 success=True,
-                                title=page_title,
-                                thumbnail=None,
-                                duration=None,
-                                stream_url=qualities[0].url,
-                                qualities=qualities,
+                                title=hub_title,
+                                thumbnail=primary_thumbnail,
+                                duration=primary_duration,
+                                stream_url=primary_stream_url,
+                                qualities=verified_qualities,
                                 headers=stream_headers,
                             )
             except Exception:
                 pass
 
-        # Phase 1: Check for Dean Edwards packed scripts
-        scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL | re.I)
-        for script in scripts:
-            if "eval(function(p,a,c,k,e,d)" in script:
-                unpacked = unpack_dean_edwards(script)
-                if unpacked:
-                    media_links = re.findall(
-                        r'https?://[^\s"\'<>]+\.(?:m3u8|mp4|webm)[^\s"\'<>]*',
-                        unpacked,
-                        re.I,
-                    )
-                    img_match = re.search(r'image\s*:\s*["\'](https?://[^"\']+)["\']', unpacked, re.I)
-                    thumbnail = img_match.group(1) if img_match else None
-
-                    dur_match = re.search(r'duration\s*:\s*["\']?([\d\.]+)["\']?', unpacked, re.I)
-                    duration = float(dur_match.group(1)) if dur_match else None
-
-                    if media_links:
-                        main_stream = media_links[0]
-                        qualities: List[VideoQuality] = []
-
-                        if ".m3u8" in main_stream:
-                            qualities = await parse_m3u8_qualities(
-                                main_stream,
-                                referer,
-                                request_headers["User-Agent"],
-                            )
-
-                        if not qualities:
-                            qualities = [VideoQuality(label="Auto (تلقائي)", url=main_stream)]
-
-                        return ExtractResponse(
-                            success=True,
-                            title=page_title,
-                            thumbnail=thumbnail,
-                            duration=duration,
-                            stream_url=main_stream,
-                            qualities=qualities,
-                            headers=stream_headers,
-                        )
-
-        # Phase 2: Direct HTML5 tags
-        direct_sources = re.findall(
-            r'<source[^>]+src=["\']([^"\']+)["\']',
-            html,
-            re.I,
-        ) or re.findall(
-            r'<video[^>]+src=["\']([^"\']+)["\']',
-            html,
-            re.I,
-        )
-
-        if direct_sources:
-            src = urllib.parse.urljoin(clean_url, direct_sources[0])
+        # Layer 2: Standard Single-Video Extraction
+        resolved = await resolve_direct_video_stream(clean_url, default_title=domain)
+        if resolved and resolved.get("stream_url"):
             return ExtractResponse(
                 success=True,
-                title=page_title,
-                thumbnail=None,
-                duration=None,
-                stream_url=src,
-                qualities=[VideoQuality(label="Original (الأصلية)", url=src)],
+                title=resolved.get("title") or domain,
+                thumbnail=resolved.get("thumbnail"),
+                duration=resolved.get("duration"),
+                stream_url=resolved["stream_url"],
+                qualities=resolved.get("qualities") or [VideoQuality(label="Original", url=resolved["stream_url"])],
                 headers=stream_headers,
             )
-
-        # Phase 3: Generic yt-dlp fallback
-        try:
-            import yt_dlp
-            ydl_opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "extract_flat": False,
-                "http_headers": request_headers,
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(clean_url, download=False)
-                if info:
-                    qualities = []
-                    formats = info.get("formats", [])
-                    for f in formats:
-                        f_url = f.get("url")
-                        if f_url and f.get("vcodec") != "none":
-                            res = f.get("format_note") or f.get("resolution") or "Video"
-                            qualities.append(VideoQuality(label=res, url=f_url, resolution=res))
-
-                    main_url = info.get("url") or (qualities[0].url if qualities else None)
-                    if main_url:
-                        return ExtractResponse(
-                            success=True,
-                            title=info.get("title") or page_title,
-                            thumbnail=info.get("thumbnail"),
-                            duration=info.get("duration"),
-                            stream_url=main_url,
-                            qualities=qualities if qualities else [VideoQuality(label="Default", url=main_url)],
-                            headers=stream_headers,
-                        )
-        except Exception:
-            pass
 
         raise HTTPException(
             status_code=404,
@@ -518,3 +651,4 @@ async def extract_video(req: ExtractRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failure: {str(e)}")
+
