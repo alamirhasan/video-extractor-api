@@ -269,7 +269,20 @@ def serve_player(src: str, referer: Optional[str] = None, title: Optional[str] =
         const video = document.getElementById('video');
         const videoSrc = '{stream_src}';
 
-        if (Hls.isSupported()) {{
+        function playDirect(src) {{
+            video.src = src;
+            const promise = video.play();
+            if (promise !== undefined) {{
+                promise.catch(function() {{
+                    video.muted = true;
+                    video.play();
+                }});
+            }}
+        }}
+
+        const isHls = videoSrc.includes('.m3u8') || videoSrc.includes('/hls/') || videoSrc.includes('.urlset');
+
+        if (isHls && Hls.isSupported()) {{
             const hls = new Hls({{
                 enableWorker: true,
                 maxBufferLength: 30,
@@ -289,30 +302,16 @@ def serve_player(src: str, referer: Optional[str] = None, title: Optional[str] =
             }});
             hls.on(Hls.Events.ERROR, function(event, data) {{
                 if (data.fatal) {{
-                    switch (data.type) {{
-                        case Hls.ErrorTypes.NETWORK_ERROR:
-                            console.log('Hls network error, recovering...');
-                            hls.startLoad();
-                            break;
-                        case Hls.ErrorTypes.MEDIA_ERROR:
-                            console.log('Hls media error, recovering...');
-                            hls.recoverMediaError();
-                            break;
-                        default:
-                            console.log('Hls fatal error:', data.details);
-                            hls.destroy();
-                            break;
-                    }}
+                    console.warn('Hls fatal error, falling back to direct video element:', data.details);
+                    hls.destroy();
+                    playDirect(videoSrc);
                 }}
             }});
-        }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-            video.src = videoSrc;
-            video.addEventListener('loadedmetadata', function() {{
-                video.play().catch(function() {{
-                    video.muted = true;
-                    video.play();
-                }});
-            }});
+        }} else if (isHls && video.canPlayType('application/vnd.apple.mpegurl')) {{
+            playDirect(videoSrc);
+        }} else {{
+            // Universal Direct Native Playback for MP4, WebM, and Raw Streams
+            playDirect(videoSrc);
         }}
     </script>
 </body>
@@ -414,6 +413,10 @@ async def resolve_direct_video_stream(url: str, default_title: str = ""):
                         unpacked,
                         re.I,
                     )
+                    file_match = re.search(r'file\s*:\s*["\'](https?://[^"\']+)["\']', unpacked, re.I)
+                    if file_match and file_match.group(1) not in media_links:
+                        media_links.insert(0, file_match.group(1))
+
                     img_match = re.search(r'image\s*:\s*["\'](https?://[^"\']+)["\']', unpacked, re.I)
                     thumbnail = img_match.group(1) if img_match else None
 
@@ -423,14 +426,14 @@ async def resolve_direct_video_stream(url: str, default_title: str = ""):
                     if media_links:
                         main_stream = media_links[0]
                         qualities: List[VideoQuality] = []
-                        if ".m3u8" in main_stream:
+                        if ".m3u8" in main_stream or "/hls/" in main_stream or ".urlset" in main_stream:
                             qualities = await parse_m3u8_qualities(
                                 main_stream,
                                 url_clean,
                                 headers["User-Agent"],
                             )
                         if not qualities:
-                            qualities = [VideoQuality(label="Auto (تلقائي)", url=main_stream)]
+                            qualities = [VideoQuality(label="Original", url=main_stream)]
                         return {
                             "stream_url": main_stream,
                             "qualities": qualities,
