@@ -161,8 +161,23 @@ async def proxy_stream(url: str, referer: Optional[str] = None):
     clean_url = urllib.parse.unquote(url)
     clean_referer = urllib.parse.unquote(referer) if referer else "https://google.com/"
     clean_referer = re.sub(r"^(https?://)www\.", r"\1", clean_referer)
-    ref_split = urllib.parse.urlsplit(clean_referer)
-    origin = f"{ref_split.scheme}://{ref_split.netloc}" if ref_split.netloc else "https://google.com"
+
+    # Auto-resolve host-specific referers to prevent 403 Forbidden on strict CDNs
+    if "mp4upload" in clean_url:
+        clean_referer = "https://www.mp4upload.com/"
+        origin = "https://www.mp4upload.com"
+    elif "uqload" in clean_url:
+        clean_referer = "https://uqload.vc/"
+        origin = "https://uqload.vc"
+    elif "mxcontent" in clean_url or "mixdrop" in clean_url:
+        clean_referer = "https://mixdrop.ag/"
+        origin = "https://mixdrop.ag"
+    elif "vidara" in clean_url or "97bf1" in clean_url:
+        clean_referer = "https://vidaraa.cc/"
+        origin = "https://vidaraa.cc"
+    else:
+        ref_split = urllib.parse.urlsplit(clean_referer)
+        origin = f"{ref_split.scheme}://{ref_split.netloc}" if ref_split.netloc else "https://google.com"
 
     headers = {
         "User-Agent": (
@@ -390,6 +405,36 @@ async def resolve_direct_video_stream(url: str, default_title: str = ""):
                         "thumbnail": poster_match.group(1) if poster_match else None,
                         "duration": None,
                     }
+        except Exception:
+            pass
+
+    # Fast-Path 3: Mixdrop Provider
+    if "mixdrop" in domain:
+        try:
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=8.0) as client:
+                resp = await client.get(url_clean)
+                html = resp.text
+                scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL | re.I)
+                for script in scripts:
+                    if "eval(function(p,a,c,k,e,d)" in script:
+                        unpacked = unpack_dean_edwards(script)
+                        if unpacked:
+                            mix_match = re.search(r'MDCore\.wurl\s*=\s*["\']([^"\']+)["\']', unpacked)
+                            if mix_match:
+                                video_url = mix_match.group(1)
+                                if video_url.startswith("//"):
+                                    video_url = f"https:{video_url}"
+                                poster_match = re.search(r'MDCore\.poster\s*=\s*["\']([^"\']+)["\']', unpacked)
+                                poster_url = poster_match.group(1) if poster_match else None
+                                if poster_url and poster_url.startswith("//"):
+                                    poster_url = f"https:{poster_url}"
+                                return {
+                                    "stream_url": video_url,
+                                    "qualities": [VideoQuality(label="Original", url=video_url)],
+                                    "title": default_title or domain,
+                                    "thumbnail": poster_url,
+                                    "duration": None,
+                                }
         except Exception:
             pass
 
