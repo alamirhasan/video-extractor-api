@@ -33,6 +33,7 @@ import video_extractor_ALL as core
 
 # ─── الإعدادات العامة ────────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", 8001))
+CF_WORKER_URL = os.environ.get("CF_WORKER_URL", "").rstrip("/")
 _URI_PAT = re.compile(r'URI="([^"]+)"')
 
 # ─── مجمع الاتصالات المتكررة (Persistent Connection Pool) ─────────────────────
@@ -271,7 +272,8 @@ class StreamingProxyHandler(BaseHTTPRequestHandler):
 
         # 1. الصفحة الرئيسية
         if parsed.path == "/":
-            body = HTML_PAGE.encode("utf-8")
+            rendered_page = HTML_PAGE.replace("__CF_WORKER_URL__", CF_WORKER_URL)
+            body = rendered_page.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -428,8 +430,21 @@ HTML_PAGE = r"""<!doctype html>
 
 <script>
 const enc = s => encodeURIComponent(btoa(unescape(encodeURIComponent(s || ''))).replace(/=/g, ''));
-const makeProxyUrl = (url, ref) => '/proxy?u=' + enc(url) + '&r=' + enc(ref);
+const cfWorkerBase = "__CF_WORKER_URL__";
+const makeProxyUrl = (url, ref) => (cfWorkerBase ? cfWorkerBase : '') + '/proxy?u=' + enc(url) + '&r=' + enc(ref);
 const $ = id => document.getElementById(id);
+
+// إظهار تنبيه في الواجهة إذا كان البث يمر عبر Cloudflare Edge
+window.addEventListener('DOMContentLoaded', () => {
+  if (cfWorkerBase) {
+    const badge = document.querySelector('.badge');
+    if (badge) {
+      badge.textContent = 'CLOUDFLARE EDGE (UNLIMITED BANDWIDTH)';
+      badge.style.background = 'rgba(16, 185, 129, 0.2)';
+      badge.style.color = '#10b981';
+    }
+  }
+});
 
 let hlsInstance = null;
 
