@@ -356,6 +356,61 @@ async def extract_video(req: ExtractRequest):
         title_match = re.search(r"<title>(.*?)</title>", html, re.I)
         page_title = title_match.group(1).strip() if title_match else domain
 
+        # Phase 0: Multi-Server Hubs (MegaMax Inertia.js)
+        if "megamax.me" in url or "files/mirror/video" in html or "files\\/mirror\\/video" in html:
+            try:
+                name_match = re.search(r'"name":"([^"]+)"', html)
+                if name_match:
+                    page_title = name_match.group(1).replace(r'\"', '"')
+
+                version_match = re.search(r'"version":"([^"]+)"', html)
+                version = version_match.group(1) if version_match else "a601a2d0d16b8ae7121ceb1fd46c1f5a"
+
+                inertia_headers = dict(request_headers)
+                inertia_headers.update({
+                    "X-Inertia": "true",
+                    "X-Inertia-Version": version,
+                    "X-Inertia-Partial-Component": "files/mirror/video",
+                    "X-Inertia-Partial-Data": "streams",
+                    "Accept": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                })
+
+                async with httpx.AsyncClient(headers=inertia_headers, follow_redirects=True, timeout=12.0) as hub_client:
+                    hub_resp = await hub_client.get(clean_url)
+                    if hub_resp.status_code == 200:
+                        hub_data = hub_resp.json()
+                        streams = hub_data.get("props", {}).get("streams", {}).get("data", [])
+                        qualities: List[VideoQuality] = []
+                        for group in streams:
+                            res_label = group.get("label", "Default").replace(" (source)", "").strip()
+                            resolution = group.get("resolution")
+                            for mirror in group.get("mirrors", []):
+                                driver = mirror.get("driver", "Server")
+                                link = mirror.get("link", "")
+                                if link.startswith("//"):
+                                    link = f"https:{link}"
+                                if link:
+                                    qualities.append(
+                                        VideoQuality(
+                                            label=f"{res_label} - {driver}",
+                                            url=link,
+                                            resolution=resolution,
+                                        )
+                                    )
+                        if qualities:
+                            return ExtractResponse(
+                                success=True,
+                                title=page_title,
+                                thumbnail=None,
+                                duration=None,
+                                stream_url=qualities[0].url,
+                                qualities=qualities,
+                                headers=stream_headers,
+                            )
+            except Exception:
+                pass
+
         # Phase 1: Check for Dean Edwards packed scripts
         scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL | re.I)
         for script in scripts:
