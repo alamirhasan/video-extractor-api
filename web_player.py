@@ -33,7 +33,7 @@ import video_extractor_ALL as core
 
 # ─── الإعدادات العامة ────────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", 8001))
-CF_WORKER_URL = os.environ.get("CF_WORKER_URL", "").rstrip("/")
+CF_WORKER_URL = os.environ.get("CF_WORKER_URL", "https://video-proxy.mrmra.workers.dev").rstrip("/")
 _URI_PAT = re.compile(r'URI="([^"]+)"')
 
 # ─── مجمع الاتصالات المتكررة (Persistent Connection Pool) ─────────────────────
