@@ -15,7 +15,7 @@ import re
 import time
 import urllib.parse
 from typing import Dict, List, Optional
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
@@ -155,9 +155,18 @@ def health_check():
 
 @app.get("/proxy.m3u8")
 @app.get("/proxy.ts")
+@app.get("/proxy.mp4")
 @app.get("/proxy")
-async def proxy_stream(url: str, referer: Optional[str] = None):
-    """Proxies m3u8 playlists and video chunks with correct Referer and Origin headers."""
+async def proxy_stream(
+    url: str,
+    referer: Optional[str] = None,
+    range: Optional[str] = Header(None),
+):
+    """
+    High-Performance Streaming Proxy.
+    Supports HTTP Range requests (206 Partial Content) and streams chunks directly
+    without buffering entire multi-hundred-megabyte files into memory.
+    """
     clean_url = urllib.parse.unquote(url)
     clean_referer = urllib.parse.unquote(referer) if referer else "https://google.com/"
     clean_referer = re.sub(r"^(https?://)www\.", r"\1", clean_referer)
@@ -189,13 +198,14 @@ async def proxy_stream(url: str, referer: Optional[str] = None):
         "Origin": origin,
         "Accept": "*/*",
     }
+    if range:
+        headers["Range"] = range
 
     try:
-        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=20.0) as client:
-            resp = await client.get(clean_url)
-            content_type = resp.headers.get("content-type", "application/octet-stream")
-
-            if "mpegurl" in content_type or clean_url.endswith(".m3u8") or ".m3u8" in clean_url:
+        # Handle HLS playlists (rewrite relative paths to proxy URLs)
+        if clean_url.endswith(".m3u8") or ".m3u8" in clean_url:
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=12.0) as client:
+                resp = await client.get(clean_url)
                 text = resp.text
                 lines = text.splitlines()
                 rewritten = []
@@ -224,31 +234,53 @@ async def proxy_stream(url: str, referer: Optional[str] = None):
                     },
                 )
 
-            # Enforce video/mp2t for TS segments to satisfy mobile ExoPlayer container sniffing
-            if ".ts" in clean_url or "mp2t" in content_type:
-                content_type = "video/mp2t"
+        # Handle Direct Streaming (MP4, TS, WebM) with Chunked Streaming & Range Support
+        client = httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30.0)
+        req = client.build_request("GET", clean_url)
+        resp = await client.send(req, stream=True)
 
-            return Response(
-                content=resp.content,
-                media_type=content_type,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Content-Type": content_type,
-                },
-            )
+        async def stream_generator():
+            try:
+                async for chunk in resp.aiter_raw(chunk_size=65536):
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+
+        response_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Range, Content-Type, Accept",
+            "Accept-Ranges": "bytes",
+        }
+        for key in ["content-type", "content-length", "content-range", "content-disposition"]:
+            val = resp.headers.get(key)
+            if val:
+                response_headers[key] = val
+
+        return StreamingResponse(
+            stream_generator(),
+            status_code=resp.status_code,
+            headers=response_headers,
+            media_type=resp.headers.get("content-type", "video/mp4"),
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Streaming proxy error: {str(e)}")
 
 
 @app.get("/player", response_class=HTMLResponse)
 def serve_player(src: str, referer: Optional[str] = None, title: Optional[str] = None):
-    """Serves a clean, responsive HTML5 player with robust Hls.js support."""
+    """Serves a clean, responsive HTML5 player with smart dual-mode playback."""
     clean_src = urllib.parse.unquote(src)
     clean_ref = urllib.parse.unquote(referer) if referer else ""
     display_title = urllib.parse.unquote(title) if title else "مشغل الفيديو"
 
+    is_mp4 = ".mp4" in clean_src or "video.mp4" in clean_src
+
     if clean_ref:
-        stream_src = f"/proxy.m3u8?url={urllib.parse.quote(clean_src)}&referer={urllib.parse.quote(clean_ref)}"
+        if is_mp4:
+            stream_src = f"/proxy.mp4?url={urllib.parse.quote(clean_src)}&referer={urllib.parse.quote(clean_ref)}"
+        else:
+            stream_src = f"/proxy.m3u8?url={urllib.parse.quote(clean_src)}&referer={urllib.parse.quote(clean_ref)}"
     else:
         stream_src = clean_src
 
@@ -553,6 +585,30 @@ async def resolve_direct_video_stream(url: str, default_title: str = ""):
 
     return None
 
+async def verify_stream_playable(url: str, referer: str = "") -> bool:
+    """Performs a lightweight pre-flight check to verify that the stream URL actually serves video bytes."""
+    try:
+        req_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Range": "bytes=0-100",
+        }
+        if "mp4upload" in url:
+            req_headers["Referer"] = "https://www.mp4upload.com/"
+        elif "uqload" in url:
+            req_headers["Referer"] = "https://uqload.vc/"
+        elif "mixdrop" in url or "mxcontent" in url:
+            req_headers["Referer"] = "https://mixdrop.ag/"
+        elif "vidara" in url or "97bf1" in url:
+            req_headers["Referer"] = "https://vidaraa.cc/"
+        elif referer:
+            req_headers["Referer"] = referer
+
+        async with httpx.AsyncClient(headers=req_headers, follow_redirects=True, timeout=3.5) as client:
+            resp = await client.get(url)
+            return resp.status_code in (200, 206)
+    except Exception:
+        return False
+
 @app.post("/extract", response_model=ExtractResponse)
 async def extract_video(req: ExtractRequest):
     url = req.url.strip()
@@ -643,14 +699,31 @@ async def extract_video(req: ExtractRequest):
 
                         # Execute video stream extraction for all mirrors in parallel
                         results = await asyncio.gather(*mirror_tasks, return_exceptions=True)
+                        
+                        # Collect candidates
+                        candidates = []
+                        for meta, res in zip(mirror_meta, results):
+                            if isinstance(res, dict) and res.get("stream_url"):
+                                candidates.append({
+                                    "meta": meta,
+                                    "res": res,
+                                    "url": res["stream_url"]
+                                })
+
+                        # Pre-flight verification: test playability of all extracted streams in parallel
+                        verification_tasks = [verify_stream_playable(c["url"]) for c in candidates]
+                        verification_results = await asyncio.gather(*verification_tasks, return_exceptions=True)
+
                         verified_qualities: List[VideoQuality] = []
                         primary_stream_url = None
                         primary_thumbnail = None
                         primary_duration = None
 
-                        for meta, res in zip(mirror_meta, results):
-                            if isinstance(res, dict) and res.get("stream_url"):
-                                s_url = res["stream_url"]
+                        for c, is_valid in zip(candidates, verification_results):
+                            if is_valid is True:
+                                s_url = c["url"]
+                                res = c["res"]
+                                meta = c["meta"]
                                 if not primary_stream_url:
                                     primary_stream_url = s_url
                                     primary_thumbnail = res.get("thumbnail")
