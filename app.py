@@ -73,31 +73,43 @@ def safe_b64decode(s: str) -> str:
 
 
 def fetch_html_smart(url: str, ref: str = "") -> str:
-    """جلب صفحة الـ HTML مباشرة أو عبر Cloudflare Worker إذا حظر السيرفر اتصال Render."""
-    headers = dict(core.UA)
-    if ref:
-        headers["Referer"] = ref
-    try:
-        r = _session.get(url, headers=headers, timeout=20)
-        if r.status_code == 200:
-            return r.text
-    except Exception:
-        pass
-
-    # إذا واجه السيرفر حظر 403 (مثل Uqload على Render) يجلبها عبر Cloudflare Edge
-    if CF_WORKER_URL:
+    """جلب صفحة الـ HTML مع دعم تدوير Referer التلقائي لتخطي حماية Embeds disabled."""
+    referers = [ref, "https://web2.topcinemaa.live/", "https://topcinema.io/"]
+    if url:
         try:
-            cf_url = f"{CF_WORKER_URL}/proxy?u={safe_b64encode(url)}&r={safe_b64encode(ref)}"
-            cf_r = _session.get(cf_url, timeout=20)
-            if cf_r.status_code == 200:
-                return cf_r.text
+            parsed = urlparse(url)
+            referers.append(f"{parsed.scheme}://{parsed.netloc}/")
         except Exception:
             pass
+    referers.append("")
+
+    for r_cand in referers:
+        headers = dict(core.UA)
+        if r_cand:
+            headers["Referer"] = r_cand
+        try:
+            resp = _session.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                txt = resp.text
+                if "Embeds disabled" not in txt and "Access denied" not in txt and "restricted for this domain" not in txt:
+                    return txt
+        except Exception:
+            pass
+
+    if CF_WORKER_URL:
+        for r_cand in [ref, "https://web2.topcinemaa.live/"]:
+            try:
+                cf_url = f"{CF_WORKER_URL}/proxy?u={safe_b64encode(url)}&r={safe_b64encode(r_cand)}"
+                cf_r = _session.get(cf_url, timeout=10)
+                if cf_r.status_code == 200 and "Embeds disabled" not in cf_r.text and "Access denied" not in cf_r.text:
+                    return cf_r.text
+            except Exception:
+                pass
     return ""
 
 
 def unpack_master_smart(embed_url: str) -> str | None:
-    """استخراج رابط master.m3u8 وفك التشفير مع دعم التخطي التلقائي عبر Cloudflare Worker."""
+    """استخراج رابط master.m3u8 وفك التشفير مع دعم تدوير Referer التلقائي."""
     html = fetch_html_smart(embed_url)
     if not html:
         return None
@@ -120,7 +132,7 @@ def unpack_master_smart(embed_url: str) -> str | None:
     srcs = cfg.get("sources") or []
     for x in srcs:
         u = x.get("file") or x.get("src")
-        if u and ("m3u8" in u.lower() or "master" in u.lower() or ".txt" in u.lower()):
+        if u and (".m3u8" in u.lower() or "master" in u.lower() or ".txt" in u.lower()):
             return u
     for k in ("file", "source"):
         if k in cfg:
@@ -168,6 +180,9 @@ def _extract_single_server(name: str, embed: str) -> dict:
                 ref = embed
                 txt = fetch_master_smart(master, ref)
                 if not txt:
+                    ref = "https://web2.topcinemaa.live/"
+                    txt = fetch_master_smart(master, ref)
+                if not txt:
                     ref = ""
                     txt = fetch_master_smart(master, ref)
                 if txt:
@@ -188,8 +203,6 @@ def _extract_single_server(name: str, embed: str) -> dict:
 def collect_links(target_servers: list[tuple[str, str]] | None = None) -> list[dict]:
     """استخراج جميع الروابط المتاحة بالتوازي (Parallel Extraction) عبر مسارات متعددة."""
     servers_to_scan = target_servers if target_servers is not None else core.SERVERS
-    
-    # فحص جميع السيرفرات بالتوازي بحد أقصى 10 مسارات عمل في وقت واحد
     results_map = {}
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_idx = {
@@ -203,10 +216,7 @@ def collect_links(target_servers: list[tuple[str, str]] | None = None) -> list[d
             except Exception:
                 name, embed = servers_to_scan[idx]
                 results_map[idx] = {"server": name, "embed": embed, "playable": []}
-
-    # الحفاظ على نفس ترتيب السيرفرات الأصلي
     return [results_map[i] for i in range(len(servers_to_scan)) if i in results_map]
-
 
 def rewrite_playlist(text: str, playlist_url: str, referer: str) -> str:
     """
