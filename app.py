@@ -72,6 +72,68 @@ def safe_b64decode(s: str) -> str:
         return ""
 
 
+def fetch_html_smart(url: str, ref: str = "") -> str:
+    """جلب صفحة الـ HTML مباشرة أو عبر Cloudflare Worker إذا حظر السيرفر اتصال Render."""
+    headers = dict(core.UA)
+    if ref:
+        headers["Referer"] = ref
+    try:
+        r = _session.get(url, headers=headers, timeout=20)
+        if r.status_code == 200:
+            return r.text
+    except Exception:
+        pass
+
+    # إذا واجه السيرفر حظر 403 (مثل Uqload على Render) يجلبها عبر Cloudflare Edge
+    if CF_WORKER_URL:
+        try:
+            cf_url = f"{CF_WORKER_URL}/proxy?u={safe_b64encode(url)}&r={safe_b64encode(ref)}"
+            cf_r = _session.get(cf_url, timeout=20)
+            if cf_r.status_code == 200:
+                return cf_r.text
+        except Exception:
+            pass
+    return ""
+
+
+def unpack_master_smart(embed_url: str) -> str | None:
+    """استخراج رابط master.m3u8 وفك التشفير مع دعم التخطي التلقائي عبر Cloudflare Worker."""
+    html = fetch_html_smart(embed_url)
+    if not html:
+        return None
+    blocks = core.find_packer_blocks(html)
+    if not blocks:
+        return None
+    import quickjs
+    ctx = quickjs.Context()
+    ctx.eval(f"var location_href = {json.dumps(embed_url)};")
+    ctx.eval(core.STUB_ENV)
+    for blk in blocks:
+        ctx.eval(f"try {{ {blk}; }} catch(e) {{}}")
+    s = ctx.eval("__captured ? JSON.stringify(__captured) : 'null'")
+    if s == "null":
+        return None
+    try:
+        cfg = json.loads(s)
+    except Exception:
+        return None
+    srcs = cfg.get("sources") or []
+    for x in srcs:
+        u = x.get("file") or x.get("src")
+        if u and ("m3u8" in u.lower() or "master" in u.lower() or ".txt" in u.lower()):
+            return u
+    for k in ("file", "source"):
+        if k in cfg:
+            return cfg[k]
+    return None
+
+
+def fetch_master_smart(url: str, ref: str) -> str | None:
+    """جلب محتوى قائمة m3u8 مع دعم التخطي التلقائي عبر Cloudflare."""
+    txt = fetch_html_smart(url, ref)
+    return txt if txt and "#EXTM3U" in txt else None
+
+
 def collect_links() -> list[dict]:
     """استخراج جميع الروابط المتاحة وتجهيزها في هيكل بيانات موحد."""
     items = []
@@ -101,16 +163,16 @@ def collect_links() -> list[dict]:
                         "ref": ref,
                     })
             else:
-                master = core.unpack_master_url(embed)
+                master = unpack_master_smart(embed)
                 if not master:
                     items.append(entry)
                     continue
 
                 ref = embed
-                txt = core.fetch_master(master, ref)
+                txt = fetch_master_smart(master, ref)
                 if not txt:
                     ref = ""
-                    txt = core.fetch_master(master, ref)
+                    txt = fetch_master_smart(master, ref)
 
                 if txt:
                     for v in core.parse_variants(txt, master):
