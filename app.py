@@ -134,47 +134,42 @@ def fetch_master_smart(url: str, ref: str) -> str | None:
     return txt if txt and "#EXTM3U" in txt else None
 
 
-def collect_links(target_servers: list[tuple[str, str]] | None = None) -> list[dict]:
-    """استخراج جميع الروابط المتاحة وتجهيزها في هيكل بيانات موحد."""
-    items = []
-    servers_to_scan = target_servers if target_servers is not None else core.SERVERS
-    for name, embed in servers_to_scan:
-        entry = {"server": name, "embed": embed, "playable": []}
-        try:
-            if "streamtape" in name.lower():
-                ref = embed.split("/e/")[0]
-                for r in core.extract_streamtape(embed):
-                    entry["playable"].append({
-                        "server": name,
-                        "kind": r["kind"],
-                        "label": r.get("label", "1080p"),
-                        "res": r.get("res", "1080p"),
-                        "url": r["url"],
-                        "ref": ref,
-                    })
-            elif "vidmoly" in name.lower():
-                ref = embed.split("/embed-")[0] + "/"
-                for r in core.extract_vidmoly(embed):
-                    entry["playable"].append({
-                        "server": name,
-                        "kind": r["kind"],
-                        "label": r.get("label", "720p"),
-                        "res": r.get("res", "720p"),
-                        "url": r["url"],
-                        "ref": ref,
-                    })
-            else:
-                master = unpack_master_smart(embed)
-                if not master:
-                    items.append(entry)
-                    continue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+def _extract_single_server(name: str, embed: str) -> dict:
+    """استخراج جودات وروابط سيرفر فردي مستقل بسرعة فائقة."""
+    entry = {"server": name, "embed": embed, "playable": []}
+    try:
+        if "streamtape" in name.lower():
+            ref = embed.split("/e/")[0]
+            for r in core.extract_streamtape(embed):
+                entry["playable"].append({
+                    "server": name,
+                    "kind": r["kind"],
+                    "label": r.get("label", "1080p"),
+                    "res": r.get("res", "1080p"),
+                    "url": r["url"],
+                    "ref": ref,
+                })
+        elif "vidmoly" in name.lower():
+            ref = embed.split("/embed-")[0] + "/"
+            for r in core.extract_vidmoly(embed):
+                entry["playable"].append({
+                    "server": name,
+                    "kind": r["kind"],
+                    "label": r.get("label", "720p"),
+                    "res": r.get("res", "720p"),
+                    "url": r["url"],
+                    "ref": ref,
+                })
+        else:
+            master = unpack_master_smart(embed)
+            if master:
                 ref = embed
                 txt = fetch_master_smart(master, ref)
                 if not txt:
                     ref = ""
                     txt = fetch_master_smart(master, ref)
-
                 if txt:
                     for v in core.parse_variants(txt, master):
                         entry["playable"].append({
@@ -185,11 +180,32 @@ def collect_links(target_servers: list[tuple[str, str]] | None = None) -> list[d
                             "url": v["url"],
                             "ref": ref,
                         })
-        except Exception:
-            pass
+    except Exception:
+        pass
+    return entry
 
-        items.append(entry)
-    return items
+
+def collect_links(target_servers: list[tuple[str, str]] | None = None) -> list[dict]:
+    """استخراج جميع الروابط المتاحة بالتوازي (Parallel Extraction) عبر مسارات متعددة."""
+    servers_to_scan = target_servers if target_servers is not None else core.SERVERS
+    
+    # فحص جميع السيرفرات بالتوازي بحد أقصى 10 مسارات عمل في وقت واحد
+    results_map = {}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_idx = {
+            executor.submit(_extract_single_server, name, embed): idx
+            for idx, (name, embed) in enumerate(servers_to_scan)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results_map[idx] = future.result()
+            except Exception:
+                name, embed = servers_to_scan[idx]
+                results_map[idx] = {"server": name, "embed": embed, "playable": []}
+
+    # الحفاظ على نفس ترتيب السيرفرات الأصلي
+    return [results_map[i] for i in range(len(servers_to_scan)) if i in results_map]
 
 
 def rewrite_playlist(text: str, playlist_url: str, referer: str) -> str:
