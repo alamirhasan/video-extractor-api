@@ -88,11 +88,15 @@ def fetch_html_smart(url: str, ref: str = "") -> str:
         if r_cand:
             headers["Referer"] = r_cand
         try:
-            resp = _session.get(url, headers=headers, timeout=10)
+            resp = _session.get(url, headers=headers, timeout=(2.5, 4.0))
             if resp.status_code == 200:
                 txt = resp.text
                 if "Embeds disabled" not in txt and "Access denied" not in txt and "restricted for this domain" not in txt:
                     return txt
+            elif resp.status_code in (404, 410):
+                break
+        except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout):
+            break
         except Exception:
             pass
 
@@ -100,7 +104,7 @@ def fetch_html_smart(url: str, ref: str = "") -> str:
         for r_cand in [ref, "https://web2.topcinemaa.live/"]:
             try:
                 cf_url = f"{CF_WORKER_URL}/proxy?u={safe_b64encode(url)}&r={safe_b64encode(r_cand)}"
-                cf_r = _session.get(cf_url, timeout=10)
+                cf_r = _session.get(cf_url, timeout=(2.5, 4.0))
                 if cf_r.status_code == 200 and "Embeds disabled" not in cf_r.text and "Access denied" not in cf_r.text:
                     return cf_r.text
             except Exception:
