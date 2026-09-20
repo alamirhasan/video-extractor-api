@@ -124,71 +124,6 @@ def fetch_html_smart(url: str, ref: str = "") -> str:
     return ""
 
 
-def extract_okru(embed_url: str) -> list[dict]:
-    """استخراج جودات OK.ru المباشرة من كائن data-options بنسبة نجاح 100%."""
-    results = []
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        resp = _session.get(embed_url, headers=headers, timeout=(2.5, 4.0))
-        if resp.status_code == 200:
-            import html as html_lib
-            m = re.search(r'data-options="([^"]+)"', resp.text)
-            if m:
-                raw_opts = html_lib.unescape(m.group(1))
-                data = json.loads(raw_opts)
-                flashvars = data.get("flashvars", {})
-                meta_raw = flashvars.get("metadata", "")
-                meta = json.loads(meta_raw) if isinstance(meta_raw, str) else meta_raw
-                if isinstance(meta, dict):
-                    res_map = {
-                        "ultra": ("4K", "3840x2160"),
-                        "quad": ("1440p", "2560x1440"),
-                        "full": ("1080p", "1920x1080"),
-                        "hd": ("720p", "1280x720"),
-                        "sd": ("480p", "854x480"),
-                        "low": ("360p", "640x360"),
-                        "lowest": ("240p", "426x240"),
-                        "mobile": ("144p", "256x144"),
-                    }
-                    for v in meta.get("videos", []):
-                        v_name = (v.get("name") or "720p").lower()
-                        v_url = v.get("url", "")
-                        if v_url:
-                            label, res = res_map.get(v_name, (v_name.upper(), "720p"))
-                            results.append({
-                                "kind": "MP4",
-                                "label": label,
-                                "res": res,
-                                "url": v_url,
-                            })
-    except Exception:
-        pass
-    return results
-
-
-def extract_uqload(embed_url: str) -> list[dict]:
-    """استخراج رابط MP4 المباشر من سيرفر Uqload."""
-    results = []
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": embed_url
-        }
-        resp = _session.get(embed_url, headers=headers, timeout=(2.5, 4.0))
-        if resp.status_code == 200:
-            m = re.search(r'sources:\s*\["([^"]+)"\]', resp.text) or re.search(r'<source\s+src="([^"]+)"', resp.text)
-            if m:
-                results.append({
-                    "kind": "MP4",
-                    "label": "720p",
-                    "res": "1280x720",
-                    "url": m.group(1),
-                })
-    except Exception:
-        pass
-    return results
-
-
 def unpack_master_smart(embed_url: str) -> str | None:
     """استخراج رابط master.m3u8 وفك التشفير مع دعم تدوير Referer التلقائي."""
     html = fetch_html_smart(embed_url)
@@ -254,26 +189,6 @@ def _extract_single_server(name: str, embed: str) -> dict:
                     "res": r.get("res", "720p"),
                     "url": r["url"],
                     "ref": ref,
-                })
-        elif "ok.ru" in embed.lower() or name.lower() == "ok" or "ok.ru" in name.lower():
-            for r in extract_okru(embed):
-                entry["playable"].append({
-                    "server": name,
-                    "kind": r["kind"],
-                    "label": r.get("label", "720p"),
-                    "res": r.get("res", "720p"),
-                    "url": r["url"],
-                    "ref": "https://ok.ru/",
-                })
-        elif "uqload" in name.lower() or "uqload" in embed.lower():
-            for r in extract_uqload(embed):
-                entry["playable"].append({
-                    "server": name,
-                    "kind": r["kind"],
-                    "label": r.get("label", "720p"),
-                    "res": r.get("res", "720p"),
-                    "url": r["url"],
-                    "ref": embed,
                 })
         else:
             master = unpack_master_smart(embed)
