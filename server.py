@@ -1,263 +1,273 @@
-import json
+"""
+File: server.py
+Role: Main HTTP API server for video extraction and proxying.
+Purpose: Deployed on Render to handle video hosts that block Cloudflare Datacenter IPs.
+         Integrates yt-dlp universal extraction and direct Packer unpacking.
+Consumers: Cloudflare Worker (/info, /hls, /proxy) and web player frontend.
+"""
+
 import os
 import re
-import urllib.error
-import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.parse
+from typing import Optional, List, Dict, Any
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-PORT = int(os.environ.get("PORT", "8000"))
-HOSTS = {"vidtube.one", "down.vidtube.one"}
+from fastapi import FastAPI, Query, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import requests
+import yt_dlp
 
+app = FastAPI(title="Video Extractor API", version="3.0")
 
-def fetch(url, referer=None):
-    headers = {"User-Agent": UA, "Accept": "*/*"}
-    if referer:
-        headers["Referer"] = referer
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=45) as resp:
-        return resp.read()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-def find_matching(s, open_idx):
-    depth = 0
-    quote = None
-    esc = False
-    for idx in range(open_idx, len(s)):
-        ch = s[idx]
-        if quote:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == quote:
-                quote = None
-            continue
-        if ch in "'\"":
-            quote = ch
-        elif ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return idx
-    return -1
-
-
-def js_split(s):
-    parts, cur, quote, esc, depth = [], [], None, False, 0
-    for ch in s:
-        if quote:
-            cur.append(ch)
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == quote:
-                quote = None
-            continue
-        if ch in "'\"":
-            quote = ch
-            cur.append(ch)
-            continue
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-        if ch == "," and depth == 0:
-            parts.append("".join(cur).strip())
-            cur = []
-        else:
-            cur.append(ch)
-    if cur:
-        parts.append("".join(cur).strip())
-    return parts
-
-
-def unescape(s):
-    if s and s[0] in "'\"":
-        s = s[1:-1]
-    return s.replace("\\'", "'").replace('\\"', '"').replace("\\\\", "\\")
-
-
-def unpack_packer(html):
-    for m in re.finditer(r"eval\(function\(p,a,c,k,e,d\)", html):
-        i = html.find("return p}", m.start())
-        if i < 0 or i > m.start() + 400:
-            continue
-        open_idx = html.find("(", i)
-        close_idx = find_matching(html, open_idx)
-        if close_idx < 0:
-            continue
-        parts = js_split(html[open_idx + 1:close_idx])
-        if len(parts) < 4:
-            continue
-        p = unescape(parts[0])
-        radix = int(parts[1], 0)
-        count = int(parts[2], 0)
-        tokens = unescape(parts[3]).split("|")
-        dec = {}
-        for tx in range(count):
-            n = tx
-            digits = ""
-            while True:
-                digits = "0123456789abcdefghijklmnopqrstuvwxyz"[n % radix] + digits
-                n //= radix
-                if n == 0:
-                    break
-            dec[digits] = tokens[tx] if tx < len(tokens) else ""
-        out = p
-        for enc, word in sorted(dec.items(), key=lambda kv: -len(kv[0])):
-            if word:
-                out = re.sub(r"\b" + enc + r"\b", word, out)
-        if "jwplayer" in out or "sources" in out:
-            return out
-    return None
-
-
-def page_title(html, video_id):
-    m = re.search(r'<meta property="og:title" content="([^"]*)"', html)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r"<title>([^<]*)</title>", html, re.I)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.S)
-    if m:
-        return re.sub(r"<[^>]+>", "", m.group(1)).strip()
-    return video_id
-
-
-def parse_master(body, master_url=None):
-    variants = []
-    for m in re.finditer(r"#EXT-X-STREAM-INF:[^\n]*BANDWIDTH=(\d+)[^\n]*RESOLUTION=(\d+)x(\d+)[^\n]*\n(\S+)", body):
-        variants.append({
-            "bandwidth": int(m.group(1)),
-            "width": int(m.group(2)),
-            "height": int(m.group(3)),
-            "label": quality_label(int(m.group(3))),
-            "url": m.group(4),
-        })
-    return variants
-
-
-def quality_label(h):
-    if h >= 1080:
-        return "1080p"
-    if h >= 720:
-        return "720p"
-    if h >= 480:
-        return "480p"
-    return "240p"
-
-
-def get_mp4_links(video_id):
-    links = {}
-    for s in ["x", "h", "n", "l"]:
-        try:
-            html = fetch(f"https://vidtube.one/d/{video_id}_{s}").decode("utf-8", "replace")
-        except Exception:
-            continue
-        mp4s = re.findall(r"https://[^\"']+\.mp4\?t=[^\"'\s]+", html)
-        if mp4s:
-            links[s] = mp4s
-    return links
-
-
-def extract_id(value):
-    value = value.strip()
-    m = re.search(r"([a-z0-9]{12,})", value)
-    return m.group(1) if m else None
-
-
-def probe_audio(variant_base, suffix=""):
-    found = {}
-    for idx in range(1, 7):
-        url = variant_base + "/index-v1-a%d.m3u8%s" % (idx, suffix)
-        try:
-            body = fetch(url).decode("utf-8", "replace")
-        except Exception:
-            continue
-        segs = re.findall(r"(seg-\d+[^\s?]+)", body)
-        if not segs:
-            continue
-        key = segs[0].split("?")[0]
-        found.setdefault(key, []).append("a%d" % idx)
-    return found
-
-
-def extract(url):
-    video_id = extract_id(url)
-    if not video_id:
-        return {"ok": False, "error": "could not find video id in: " + url}
+def get_media_referer(u: str, explicit_ref: Optional[str] = None) -> str:
+    if explicit_ref:
+        return explicit_ref
     try:
-        html = fetch("https://vidtube.one/%s.html" % video_id).decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return {"ok": False, "error": "vidtube page HTTP %s (blocked?)" % e.code}
+        host = urllib.parse.urlparse(u).hostname.lower()
+        if "cdn-video.xyz" in host:
+            return "https://vidtube.cam/"
+        if "1vid." in host:
+            return "https://1vid.xyz/"
+        if "vmnow." in host or "vidmoly." in host:
+            return "https://vidmoly.org/"
+        if "cdnz." in host or "vidspeed." in host:
+            return "https://vidspeed.org/"
+        if "uqload." in host:
+            return "https://uqload.vc/"
+        if "mixdrop." in host or "soakysecrets." in host:
+            return "https://mixdrop.top/"
+        if "streamtape." in host or "tapecontent." in host:
+            return "https://streamtape.cc/"
+        if "premilkyway." in host or "hlswish." in host:
+            return "https://hlswish.com/"
+        if "acek-cdn." in host or "dramiyos-cdn." in host or "earnvids." in host:
+            return "https://morencius.com/"
+        return f"{urllib.parse.urlparse(u).scheme}://{urllib.parse.urlparse(u).netloc}/"
+    except Exception:
+        return ""
+
+def unpack_packer(html: str) -> str:
+    out = []
+    matches = re.finditer(r"eval\(function\(p,a,c,k,e,d\)", html)
+    for m in matches:
+        start = m.start()
+        open_paren = html.find("(", start + 4)
+        if open_paren == -1:
+            continue
+        depth = 0
+        end = -1
+        for i in range(open_paren, len(html)):
+            ch = html[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end == -1:
+            continue
+        args_str = html[open_paren + 1:end].strip()
+        parts = [p.strip() for p in args_str.split(",")]
+        if len(parts) >= 4:
+            out.append(args_str)
+    return "\n".join(out)
+
+def extract_with_ytdlp(url: str) -> Optional[Dict[str, Any]]:
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'format': 'best',
+        'extract_flat': False,
+        'user_agent': UA,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                return None
+            
+            title = info.get('title', '')
+            formats = info.get('formats', [])
+            hls_urls = set()
+            mp4_urls = set()
+            variants = []
+
+            for f in formats:
+                f_url = f.get('url', '')
+                if not f_url or not f_url.startswith('http'):
+                    continue
+                ext = f.get('ext', '').lower()
+                h = f.get('height') or 0
+                w = f.get('width') or 0
+                bw = f.get('tbr') or 0
+                format_note = f.get('format_note', '')
+
+                if '.m3u8' in f_url or ext == 'm3u8':
+                    hls_urls.add(f_url)
+                    variants.append({
+                        "url": f_url,
+                        "height": h,
+                        "width": w,
+                        "bandwidth": int(bw * 1000) if bw else 0,
+                        "label": f"{h}p" if h else (format_note or "auto")
+                    })
+                elif '.mp4' in f_url or ext in ['mp4', 'webm', 'mkv']:
+                    mp4_urls.add(f_url)
+
+            return {
+                "title": title,
+                "hls": list(hls_urls),
+                "mp4": list(mp4_urls),
+                "variants": variants
+            }
+    except Exception:
+        return None
+
+def extract_direct_regex(url: str) -> Dict[str, Any]:
+    headers = {
+        "User-Agent": UA,
+        "Referer": url,
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        html = resp.text
     except Exception as e:
-        return {"ok": False, "error": "vidtube page fetch failed: %s" % e}
+        return {"url": url, "error": str(e), "hls": [], "mp4": [], "variants": []}
 
-    out = {"ok": True, "id": video_id, "title": page_title(html, video_id)}
+    title_match = re.search(r'<title>([^<]+)</title>', html, re.I)
+    title = title_match.group(1).strip() if title_match else ""
 
-    cfg = unpack_packer(html)
-    master_url = None
-    if cfg:
-        m = re.search(r'file:"(https://[^"]+\.m3u8[^"]*)"', cfg)
-        if m:
-            master_url = m.group(1)
+    hls = set()
+    mp4 = set()
 
-    if not master_url:
-        m = re.search(r'https://[^"\'<>\s]+\.m3u8[^"\'<>\s]*', html)
-        if m:
-            master_url = m.group(0)
+    # Direct URLs
+    direct_m3u8 = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html, re.I)
+    for u in direct_m3u8:
+        hls.add(u)
 
-    if master_url:
-        out["master"] = master_url
-        try:
-            body = fetch(master_url, referer="https://vidtube.one/%s.html" % video_id).decode("utf-8", "replace")
-            v = parse_master(body)
-            if v:
-                out["variants"] = [{"url": u["url"], "width": u["width"], "height": u["height"],
-                                    "bandwidth": u["bandwidth"], "label": u["label"]} for u in v]
-            if v:
-                try:
-                    out["audio"] = probe_audio(v[0]["url"].split("?")[0],
-                                               ("?" + v[0]["url"].split("?")[1]) if "?" in v[0]["url"] else "")
-                except Exception:
-                    pass
-        except Exception as e:
-            out["master_error"] = str(e)
+    # Streamtape robotlink
+    tape_match = re.search(r"document\.getElementById\(['\"](?:robotlink|ideolink)['\"]\)\.innerHTML\s*=\s*['\"]([^'\"]+)['\"]\s*\+\s*\(['\"]([^'\"]+)['\"]\)\.substring\((\d+)\)(?:\.substring\((\d+)\))?", html, re.I)
+    if tape_match:
+        part1 = tape_match.group(1)
+        part2 = tape_match.group(2)
+        sub1 = int(tape_match.group(3) or "0")
+        sub2 = int(tape_match.group(4) or "0")
+        if sub1:
+            part2 = part2[sub1:]
+        if sub2:
+            part2 = part2[sub2:]
+        full = part1 + part2
+        if full.startswith("//"):
+            full = "https:" + full
+        mp4.add(full)
 
-    out["mp4"] = get_mp4_links(video_id)
-    return out
+    # Packed JS sources
+    packed_sources = re.findall(r'(?:file|source|src)\s*[:=]\s*["\'](https?://[^"\']+)["\']', html, re.I)
+    for u in packed_sources:
+        if ".m3u8" in u:
+            hls.add(u)
+        elif ".mp4" in u:
+            mp4.add(u)
 
+    return {
+        "url": url,
+        "title": title,
+        "hls": list(hls),
+        "mp4": list(mp4),
+        "variants": [{"url": u, "label": "auto"} for u in hls]
+    }
 
-class H(BaseHTTPRequestHandler):
-    def _send(self, code, data):
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+@app.get("/")
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "service": "video-extractor-api", "version": "3.0"}
 
-    def do_GET(self):
-        from urllib.parse import urlparse, parse_qs
-        u = urlparse(self.path)
-        q = parse_qs(u.query)
-        if u.path == "/health":
-            self._send(200, {"ok": True})
-            return
-        if u.path == "/extract":
-            url = (q.get("url") or q.get("v") or [None])[0]
-            if not url:
-                self._send(400, {"ok": False, "error": "missing url"})
-                return
-            self._send(200, extract(url))
-            return
-        self._send(404, {"ok": False, "error": "not found"})
+@app.get("/info")
+def get_info(v: Optional[str] = None, url: Optional[str] = None):
+    target = v or url
+    if not target:
+        return JSONResponse({"error": "missing parameter v or url"}, status_code=400)
 
+    # 1. Try yt-dlp first
+    data = extract_with_ytdlp(target)
+    if data and (data["hls"] or data["mp4"]):
+        data["url"] = target
+        return data
 
-server = ThreadingHTTPServer(("0.0.0.0", PORT), H)
-server.serve_forever()
+    # 2. Fallback to direct regex/unpack
+    direct_data = extract_direct_regex(target)
+    return direct_data
+
+@app.get("/hls")
+def proxy_hls(u: str = Query(...), ref: Optional[str] = None):
+    referer = get_media_referer(u, ref)
+    headers = {"User-Agent": UA, "Referer": referer}
+    try:
+        r = requests.get(u, headers=headers, timeout=12)
+        content = r.text
+        
+        # Rewrite relative URLs to absolute or proxied
+        lines = content.split("\n")
+        out = []
+        for line in lines:
+            trimmed = line.strip()
+            if not trimmed or trimmed.startswith("#"):
+                out.append(line)
+                continue
+            abs_url = urllib.parse.urljoin(u, trimmed)
+            out.append(f"/proxy?u={urllib.parse.quote(abs_url)}&ref={urllib.parse.quote(referer)}")
+        
+        return Response(
+            content="\n".join(out),
+            media_type="application/vnd.apple.mpegurl",
+            headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"}
+        )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+@app.get("/proxy")
+def proxy_media(request: Request, u: str = Query(...), ref: Optional[str] = None):
+    referer = get_media_referer(u, ref)
+    headers = {
+        "User-Agent": UA,
+        "Referer": referer,
+        "Origin": referer if referer else f"{urllib.parse.urlparse(u).scheme}://{urllib.parse.urlparse(u).netloc}"
+    }
+    
+    range_header = request.headers.get("range")
+    if range_header:
+        headers["Range"] = range_header
+
+    try:
+        r = requests.get(u, headers=headers, stream=True, timeout=15)
+        
+        resp_headers = {}
+        for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"]:
+            if k in r.headers:
+                resp_headers[k] = r.headers[k]
+        resp_headers["Access-Control-Allow-Origin"] = "*"
+        resp_headers["Cache-Control"] = "public, max-age=3600"
+
+        return StreamingResponse(
+            r.iter_content(chunk_size=64 * 1024),
+            status_code=r.status_code,
+            headers=resp_headers
+        )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("server:app", host="0.0.0.0", port=port)
