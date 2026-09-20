@@ -82,6 +82,7 @@ def collect_links() -> list[dict]:
                 ref = embed.split("/e/")[0]
                 for r in core.extract_streamtape(embed):
                     entry["playable"].append({
+                        "server": name,
                         "kind": r["kind"],
                         "label": r.get("label", "1080p"),
                         "res": r.get("res", "1080p"),
@@ -92,6 +93,7 @@ def collect_links() -> list[dict]:
                 ref = embed.split("/embed-")[0] + "/"
                 for r in core.extract_vidmoly(embed):
                     entry["playable"].append({
+                        "server": name,
                         "kind": r["kind"],
                         "label": r.get("label", "720p"),
                         "res": r.get("res", "720p"),
@@ -113,6 +115,7 @@ def collect_links() -> list[dict]:
                 if txt:
                     for v in core.parse_variants(txt, master):
                         entry["playable"].append({
+                            "server": name,
                             "kind": "HLS",
                             "label": v["label"],
                             "res": v["res"],
@@ -431,18 +434,25 @@ HTML_PAGE = r"""<!doctype html>
 <script>
 const enc = s => encodeURIComponent(btoa(unescape(encodeURIComponent(s || ''))).replace(/=/g, ''));
 const cfWorkerBase = "__CF_WORKER_URL__";
-const makeProxyUrl = (url, ref) => (cfWorkerBase ? cfWorkerBase : '') + '/proxy?u=' + enc(url) + '&r=' + enc(ref);
+
+// توجيه هجين ذكي (Smart Hybrid Routing):
+// السيرفرات المقيدة بالآيبي (StreamTape, VidMoly, 1Vid) تمر عبر بروكسي Render الأصلي.
+// السيرفرات المتوافقة مع Cloudflare (Hlswish, Vidoba, VidSpeed) تمر عبر Cloudflare Edge لتوفير الباندويث.
+function makeProxyUrl(item) {
+  const srv = (item.server || '').toLowerCase();
+  const requiresDirectIp = srv.includes('streamtape') || srv.includes('vidmoly') || srv.includes('1vid');
+  const base = (!requiresDirectIp && cfWorkerBase) ? cfWorkerBase : '';
+  return base + '/proxy?u=' + enc(item.url) + '&r=' + enc(item.ref);
+}
 const $ = id => document.getElementById(id);
 
-// إظهار تنبيه في الواجهة إذا كان البث يمر عبر Cloudflare Edge
+// إظهار تنبيه في الواجهة يوضح المعمارية الهجينة
 window.addEventListener('DOMContentLoaded', () => {
-  if (cfWorkerBase) {
-    const badge = document.querySelector('.badge');
-    if (badge) {
-      badge.textContent = 'CLOUDFLARE EDGE (UNLIMITED BANDWIDTH)';
-      badge.style.background = 'rgba(16, 185, 129, 0.2)';
-      badge.style.color = '#10b981';
-    }
+  const badge = document.querySelector('.badge');
+  if (badge) {
+    badge.textContent = 'SMART HYBRID STREAMING (EDGE + ORIGIN)';
+    badge.style.background = 'rgba(16, 185, 129, 0.2)';
+    badge.style.color = '#10b981';
   }
 });
 
@@ -468,7 +478,7 @@ function startPlayback(item, chipEl) {
   v.style.display = 'block';
   $('current-stream').textContent = 'جارٍ البث: ' + item.server + ' [' + item.label + ']';
 
-  const proxyStreamUrl = makeProxyUrl(item.url, item.ref);
+  const proxyStreamUrl = makeProxyUrl(item);
 
   if (item.kind === 'MP4') {
     v.src = proxyStreamUrl;
@@ -558,7 +568,8 @@ function renderServerList(data) {
         const chip = document.createElement('div');
         chip.className = 'chip';
         chip.innerHTML = `<span>${p.label}</span> <span class="chip-type">${p.kind} ${p.res || ''}</span>`;
-        chip.onclick = () => startPlayback(p, chip);
+        const playItem = Object.assign({}, p, { server: srv.server });
+        chip.onclick = () => startPlayback(playItem, chip);
         chips.appendChild(chip);
       });
       card.appendChild(chips);
