@@ -1,3 +1,0 @@
-name = "video-proxy"
-main = "cloudflare_worker.js"
-compatibility_date = "2024-09-20"
