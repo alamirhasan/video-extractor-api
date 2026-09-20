@@ -134,10 +134,11 @@ def fetch_master_smart(url: str, ref: str) -> str | None:
     return txt if txt and "#EXTM3U" in txt else None
 
 
-def collect_links() -> list[dict]:
+def collect_links(target_servers: list[tuple[str, str]] | None = None) -> list[dict]:
     """استخراج جميع الروابط المتاحة وتجهيزها في هيكل بيانات موحد."""
     items = []
-    for name, embed in core.SERVERS:
+    servers_to_scan = target_servers if target_servers is not None else core.SERVERS
+    for name, embed in servers_to_scan:
         entry = {"server": name, "embed": embed, "playable": []}
         try:
             if "streamtape" in name.lower():
@@ -232,7 +233,7 @@ class StreamingProxyHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self):
         """إرسال ترويسات مشاركة الموارد (CORS) لكافة المتصفحات والمشغلات."""
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Range, Content-Type, Authorization, Accept, X-Requested-With")
         self.send_header("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -243,6 +244,41 @@ class StreamingProxyHandler(BaseHTTPRequestHandler):
         self._send_cors_headers()
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def do_POST(self):
+        """معالجة طلبات POST لاستخراج روابط سيرفرات أي فيلم مخصص."""
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/links":
+            content_length = int(self.headers.get("Content-Length", 0))
+            post_data = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+            try:
+                payload = json.loads(post_data)
+            except Exception:
+                payload = {}
+
+            # استخراج قائمة السيرفرات إما كمصفوفة كائنات أو مصفوفة أزواج
+            raw_servers = payload.get("servers") or []
+            servers_list = []
+            for s in raw_servers:
+                if isinstance(s, dict):
+                    name = s.get("name") or s.get("server") or ""
+                    url = s.get("url") or s.get("embed") or ""
+                    if name and url:
+                        servers_list.append((name, url))
+                elif isinstance(s, (list, tuple)) and len(s) >= 2:
+                    servers_list.append((s[0], s[1]))
+
+            links = collect_links(servers_list if servers_list else None)
+            body = json.dumps(links, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        self._send_error(404, "Not Found")
 
     def _send_error(self, code: int, message: str):
         body = message.encode("utf-8")
